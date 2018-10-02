@@ -139,7 +139,7 @@ def main(opts):
                        ])),
         batch_size=opts.batch_size, shuffle=True, num_workers=4, pin_memory=opts.cuda)
 
-    model = CNNModel(opts)
+    model = CNNModel(opts).to(opts.device)
     optimizer = optim.Adam(model.parameters(), lr=opts.learning_rate)
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=1.-opts.learning_decay, last_epoch=-1)
 
