@@ -52,25 +52,48 @@ def get_args():
 
     return opts
 
+class AttrProxy(object):
+    '''Borrowed from https://discuss.pytorch.org/t/list-of-nn-module-in-a-nn-module/219/2'''
+    def __init__(self, module, prefix, n_layers):
+        self.module = module
+        self.prefix = prefix
+        self.length = n_layers
+    def __getitem__(self, index):
+        return getattr(self.module, self.prefix+str(index))
+    def __iter__(self):
+        return (getattr(self.module, self.prefix+str(i)) for i in range(self.length))
+
 class CNNModel(nn.Module):
     def __init__(self, opts):
         super().__init__()
         self.opts = opts
         self.dropout = opts.dropout
         units = [1] + opts.hidden_units
-        self.convs = [nn.Conv2d(units[i], units[i+1], 3, stride=2) for i in range(len(opts.hidden_units))]
-        self.fc = nn.Linear(opts.hidden_units[-1], 10)
+        for i in range(len(opts.hidden_units)):
+            self.add_module('conv'+str(i), nn.Conv2d(units[i], units[i+1], kernel_size=3, stride=2))
+        self.convs = AttrProxy(self, 'conv', len(opts.hidden_units))
+        self.fc = nn.Linear(units[-1], 10)
         self.writer = SummaryWriter(log_dir=opts.log_dir)
+        self.train_steps = 0
+        self.last_log_time = None
+
+    def add_graph_to_tensorboard(self):
+        dummy_input = torch.autograd.Variable(torch.rand(1, 1, 28, 28))
+        self.writer.add_graph(self, dummy_input)
 
     def forward(self, x):
         for conv in self.convs:
-            x = F.dropout(F.relu(conv(x)), training=self.training)
-        x = F.avg_pool2d(x, x.shape[2])
+            x = conv(x)
+            x = F.relu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = F.avg_pool2d(x, int(x.shape[2]))
         x = x.view(-1, self.opts.hidden_units[-1])
         x = self.fc(x)
         return F.log_softmax(x, dim=1)
 
     def train_step(self, dataloader, optimizer, opts, epoch=-1):
+        if self.last_log_time is None:
+            self.last_log_time = time.time()
         self.train()
         for batch_idx, (data, target) in enumerate(dataloader):
             data, target = data.to(opts.device), target.to(opts.device)
@@ -80,15 +103,16 @@ class CNNModel(nn.Module):
             loss.backward()
             optimizer.step()
 
-            if opts.i_iter % opts.log_freq == 0:
-                seconds = time.time() - opts.last_log_time
+            self.train_steps += 1
+            if self.train_steps % opts.log_freq == 0:
+                seconds = time.time() - self.last_log_time
                 steps_per_sec = float(opts.log_freq)/seconds
                 self.writer.add_scalars('loss/train',
                                         {'train_loss': loss.item()},
-                                        opts.i_iter)
+                                        self.train_steps)
                 self.writer.add_scalars('steps/',
                                         {'steps_per_sec': steps_per_sec},
-                                        opts.i_iter)
+                                        self.train_steps)
 
                 print('Train Epoch: {} [{}/{} ({:.0f}%)]\tSteps/s {:.3f}\tLoss: {:.6f}'.format(
                     epoch,
@@ -97,8 +121,7 @@ class CNNModel(nn.Module):
                     100. * batch_idx / len(dataloader),
                     steps_per_sec,
                     loss.item()))
-                opts.last_log_time = time.time()
-            opts.i_iter += 1
+                self.last_log_time = time.time()
 
     def evaluate(self, dataloader, opts, epoch=-1):
         self.eval()
@@ -116,10 +139,10 @@ class CNNModel(nn.Module):
         accuracy = float(correct) / len(dataloader.dataset)
         self.writer.add_scalars('loss/eval',
                                 {'eval_loss': eval_loss},
-                                opts.i_iter)
+                                self.train_steps)
         self.writer.add_scalars('accuracy/eval',
                                 {'eval_accuracy': accuracy},
-                                opts.i_iter)
+                                self.train_steps)
         print('Evaluation: Loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)'.format(
             eval_loss, correct, len(dataloader.dataset),
             100.*accuracy))
@@ -143,8 +166,7 @@ def main(opts):
     optimizer = optim.Adam(model.parameters(), lr=opts.learning_rate)
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=1.-opts.learning_decay, last_epoch=-1)
 
-    opts.i_iter = 1
-    opts.last_log_time = time.time()
+    model.add_graph_to_tensorboard()
     for epoch in range(1, opts.epochs + 1):
         scheduler.step()
         model.train_step(train_loader, optimizer, opts, epoch)
