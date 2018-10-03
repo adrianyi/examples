@@ -78,7 +78,7 @@ class CNNModel(nn.Module):
         self.last_log_time = None
 
     def add_graph_to_tensorboard(self):
-        dummy_input = torch.autograd.Variable(torch.rand(1, 1, 28, 28))
+        dummy_input = torch.autograd.Variable(torch.rand(1, 1, 28, 28)).to(self.opts.device)
         self.writer.add_graph(self, dummy_input)
 
     def forward(self, x):
