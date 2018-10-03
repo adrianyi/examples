@@ -131,7 +131,7 @@ class CNNModel(nn.Module):
             for data, target in dataloader:
                 data, target = data.to(opts.device), target.to(opts.device)
                 output = self.forward(data)
-                eval_loss += F.nll_loss(output, target, reduction='sum').item()
+                eval_loss += F.nll_loss(output, target, size_average=False).item()
                 pred = output.max(1, keepdim=True)[1]
                 correct += pred.eq(target.view_as(pred)).sum().item()
 
