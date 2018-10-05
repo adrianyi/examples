@@ -1,7 +1,9 @@
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+import os
 import time
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -9,6 +11,20 @@ from torchvision import datasets, transforms
 from tensorboardX import SummaryWriter
 
 from clusterone import get_data_path, get_logs_path
+
+print(os.environ)
+try:
+    job_name = os.environ['JOB_NAME']
+    task_index = int(os.environ['TASK_INDEX'])
+    ps_hosts = os.environ['PS_HOSTS'].split(',')
+    worker_hosts = os.environ['WORKER_HOSTS'].split(',')
+    n_workers = len(worker_hosts)
+except:
+    job_name = None
+    task_index = 0
+    ps_hosts = None
+    worker_hosts = None
+    n_workers = 1
 
 def str2bool(v):
     ''''''
@@ -46,9 +62,10 @@ def get_args():
                                  path = '')
     opts.log_dir = get_logs_path(root = opts.local_log_dir)
 
-    if opts.cuda is None:
-        opts.cuda = torch.cuda.is_available()
+    opts.cuda = opts.cuda or torch.cuda.is_available()
     opts.device = torch.device('cuda' if opts.cuda else 'cpu')
+
+    opts.distributed = n_workers > 1
 
     return opts
 
@@ -131,6 +148,7 @@ class CNNModel(nn.Module):
             for data, target in dataloader:
                 data, target = data.to(opts.device), target.to(opts.device)
                 output = self.forward(data)
+                # TODO: size_average is deprecated after 0.4.0. Use reduction='sum'.
                 eval_loss += F.nll_loss(output, target, size_average=False).item()
                 pred = output.max(1, keepdim=True)[1]
                 correct += pred.eq(target.view_as(pred)).sum().item()
@@ -148,13 +166,20 @@ class CNNModel(nn.Module):
             100.*accuracy))
 
 def main(opts):
-    train_loader = torch.utils.data.DataLoader(
-        datasets.MNIST(opts.data_dir, train=True, download=True,
-                       transform=transforms.Compose([
-                           transforms.ToTensor(),
-                           transforms.Normalize((0.1307,), (0.3081,))
-                       ])),
-        batch_size=opts.batch_size, shuffle=True, num_workers=4, pin_memory=opts.cuda)
+    if opts.distributed:
+        dist.init_process_group(backend='tcp', rank=task_index, init_method=worker_hosts[0], world_size=n_workers)
+
+    train_dataset = datasets.MNIST(opts.data_dir, train=True, download=True,
+                                   transform=transforms.Compose([
+                                        transforms.ToTensor(),
+                                        transforms.Normalize((0.1307,), (0.3081,))
+                                   ]))
+    if opts.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+        batch_size=opts.batch_size, shuffle=True, num_workers=4, pin_memory=opts.cuda, sampler=train_sampler)
     test_loader = torch.utils.data.DataLoader(
         datasets.MNIST(opts.data_dir, train=False, transform=transforms.Compose([
                            transforms.ToTensor(),
@@ -163,11 +188,15 @@ def main(opts):
         batch_size=opts.batch_size, shuffle=True, num_workers=4, pin_memory=opts.cuda)
 
     model = CNNModel(opts).to(opts.device)
+    if opts.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model)
     optimizer = optim.Adam(model.parameters(), lr=opts.learning_rate)
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=1.-opts.learning_decay, last_epoch=-1)
 
     model.add_graph_to_tensorboard()
     for epoch in range(1, opts.epochs + 1):
+        if opts.distributed:
+            train_sampler.set_epoch(epoch)
         scheduler.step()
         model.train_step(train_loader, optimizer, opts, epoch)
         model.evaluate(test_loader, opts, epoch)
